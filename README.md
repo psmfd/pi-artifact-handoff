@@ -1,44 +1,24 @@
-# pi-artifact-handoff
+# artifact-handoff
 
-> **Distribution mirror.** Developed in a private source-of-truth repo and synced here for distribution
-> (current sync: `pi_config@d653613`, 2026-06-12). The `main` branch is force-synced — please don't
-> target PRs at it directly; file an [issue](https://github.com/psmfd/pi-artifact-handoff/issues)
-> instead and fixes will land via the next sync.
+First-party pi extension to this repo. Registers the `artifact_review` tool for the Tier 3 review-handoff workflow.
 
-Pi extension that registers the `artifact_review` tool: path-confined writes of large review artifacts (reports, ADR drafts, evidence payloads) under a `.review/` directory in the project, so they land in the PR diff for line-anchored human review instead of being dumped into the conversation.
-
-## Install
-
-```bash
-pi install git:github.com/psmfd/pi-artifact-handoff@v0.1.0
-```
-
-Or try it for a single session without installing:
-
-```bash
-pi -e git:github.com/psmfd/pi-artifact-handoff
-```
-
-No build step — pi loads the TypeScript directly. The pi SDK and `typebox` are bundled by pi itself; this extension has no runtime dependencies of its own.
+- **Source rules:** [ADR-0006](../../../adrs/0006-artifact-handoff-and-review-format.md) § Tooling, [ADR-0007](../../../adrs/0007-tier-3-payload-path.md) § Coupled deliverables
+- **Companion infrastructure:** [`.review/`](../../../.review/README.md), [`.github/workflows/artifact-review-guard.yml`](../../../.github/workflows/artifact-review-guard.yml), [`CODEOWNERS`](../../../CODEOWNERS), [`agent/rules/github-flow.md`](../../rules/github-flow.md) § `artifact-review`-labeled-draft-PR carve-out
 
 ## Registered tool
 
 | Name | Purpose |
 |---|---|
-| `artifact_review` | Write a review-artifact payload under `.review/`. Returns the relative path and byte count on success. |
+| `artifact_review` | Write a Tier 3 review-artifact payload under `.review/`. Returns the relative path and byte count on success. |
 
 ### Parameters (typebox)
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `path` | string | yes | Path relative to the repo root that must resolve under `.review/`. Absolute paths and `..` segments are refused before resolution. |
-| `content` | string | yes | UTF-8 file contents to write. |
+| `content` | string | yes | UTF-8 file contents to write. The orchestrator is expected to author the artifact body following [ADR-0006](../../../adrs/0006-artifact-handoff-and-review-format.md) § 1 conventions (`<!-- block:* id=cN -->` / `<!-- review:* id=aN -->` sentinels). |
 
 The handler `mkdir -p`s the parent directory automatically; nested artifact paths like `.review/issue-99/findings.md` work without a separate prep step.
-
-## Suggested workflow
-
-`.review/` artifacts are intended to be **ephemeral**: they live on a feature branch during review and are deleted before the PR merges. If you adopt this pattern, consider a CI guard that fails any PR whose diff still adds files under `.review/` at merge time, so review artifacts never reach your integration branch.
 
 ## Refusal policy (per-rule)
 
@@ -53,25 +33,22 @@ The handler `mkdir -p`s the parent directory automatically; nested artifact path
 
 All are hard refusals. There is **no override mechanism** for path confinement — the `.review/` directory *is* the entire point of the tool. Use the built-in `write` tool for anything else.
 
-## Secrets-guard interaction
+## Secrets-guard interaction (in-scope; not a separate refusal)
 
-`artifact_review` is a custom tool, so it does not automatically inherit a secrets guard's `write`/`edit` coverage. The companion [`pi-secrets-guard`](https://github.com/psmfd/pi-secrets-guard) extension explicitly includes `artifact_review` in the same content-scan branch as `write` — PEM private keys, AWS access keys, GitHub PATs, and vault-named-without-header files are all caught *before* the `artifact_review` handler executes. If you run this extension without `pi-secrets-guard`, artifact writes are not content-scanned.
+`artifact_review` is a custom tool, so it does not automatically inherit secrets-guard's `write`/`edit` coverage. The `secrets-guard/` extension's tool-call handler is explicitly extended to include `artifact_review` in the same content-scan branch as `write`. This means PEM private keys, AWS access keys, GitHub PATs, and vault-named-without-header files are all caught by secrets-guard *before* the `artifact_review` handler executes.
+
+The smoke test `scripts/validate.sh` § 6b — secrets-guard SKIP_PATH_GLOBS smoke test asserts that `.review/**` is **NOT** in `SKIP_PATH_GLOBS`. If a future change to `secrets-guard/index.ts` adds `.review/**` to the skip list (effectively disabling scans), `validate.sh` fails. See [ADR-0006 § Consequences](../../../adrs/0006-artifact-handoff-and-review-format.md) for the original commitment.
+
+## Override mechanisms
+
+None. See § Refusal policy. To bypass the secrets-guard content scan specifically, see `agent/extensions/secrets-guard/README.md` (the `SKIP_SECRETS_GUARD=1` and `.secrets-guard-allowlist` overrides are session-scoped and audited).
 
 ## File layout
 
 ```text
-pi-artifact-handoff/
+agent/extensions/artifact-handoff/
 ├── index.ts        # Registers the artifact_review tool
 └── README.md       # This file
 ```
 
-## Development
-
-```bash
-npm install
-npm run typecheck
-```
-
-## License
-
-[MIT](LICENSE)
+No `package.json`, no `tsconfig.json`. Pi loads `.ts` via jiti; the typebox + `@earendil-works/pi-coding-agent` types are pi-provided "available imports".
