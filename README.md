@@ -9,6 +9,14 @@ directory, with strict path confinement.
   directory, an `artifact-review-guard` CI workflow, `CODEOWNERS`, and the
   github-flow rule's `artifact-review`-labeled-draft-PR carve-out.
 
+## Install
+
+```sh
+pi install git:github.com/psmfd/pi-artifact-handoff
+```
+
+Try it first without installing: `pi -e git:github.com/psmfd/pi-artifact-handoff`.
+
 ## Registered tool
 
 | Name | Purpose |
