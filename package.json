@@ -1,6 +1,6 @@
 {
 	"name": "@psmfd/pi-artifact-handoff",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Pi extension: registers the artifact_review tool — path-confined review-artifact writes under .review/",
 	"type": "module",
 	"license": "MIT",
