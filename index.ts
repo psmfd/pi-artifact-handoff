@@ -10,6 +10,18 @@
  *   - input path must be relative (absolute paths refused)
  *   - input path must not contain `..` segments (refused before resolution)
  *   - resolved path must equal `<cwd>/.review` or live strictly under it
+ *   - the `.review` root must be a real directory (not a symlink) — checked
+ *     before mkdir so a planted `.review -> /evil` symlink cannot be traversed
+ *   - the parent directory is opened O_DIRECTORY|O_NOFOLLOW and realpath-checked
+ *     back under `.review`, and the leaf is opened O_NOFOLLOW
+ *
+ * Symlink threat model (#824): an adversarial branch/worktree the agent operates
+ * on can commit `.review` (or a component under it) as a symlink. O_NOFOLLOW only
+ * guards the trailing component, so intermediate/root symlinks are defended
+ * separately (lstat the root; realpath the parent under the verified root; open
+ * the parent O_DIRECTORY|O_NOFOLLOW). A residual concurrent-swap TOCTOU on an
+ * intermediate directory cannot be fully closed in portable Node (no openat(2))
+ * and is out of scope for ADR-0007's single-operator local-CLI trust model.
  *
  * Override mechanism: none. Path confinement is a hard invariant of the
  * Tier 3 contract per ADR-0007 — the `.review/` directory is the entire
@@ -31,6 +43,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const REVIEW_DIR = ".review";
+
+/**
+ * Error-shaped tool result. `details` is required by `AgentToolResult<T>`; on
+ * refusals we surface no structured payload and set the duck-typed `isError`
+ * flag pi's TUI consumes (see `pi/examples/extensions/tic-tac-toe.ts`). `T`
+ * widens to `unknown` for the union with the success path's typed details.
+ */
+function refuse(text: string) {
+  return {
+    content: [{ type: "text" as const, text: `artifact_review: ${text}` }],
+    details: undefined,
+    isError: true,
+  };
+}
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
@@ -60,107 +86,142 @@ export default function (pi: ExtensionAPI) {
       const { path: rel, content } = params;
 
       if (isAbsolute(rel) || rel.split(/[\\/]/).includes("..")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `artifact_review: refusing '${rel}' — absolute paths and '..' segments are not permitted. Pass a path relative to the repo root that resolves under ${REVIEW_DIR}/.`,
-            },
-          ],
-          // `details` is required by AgentToolResult<T>; on error paths we
-          // surface no structured payload. `isError: true` is the duck-typed
-          // extra field pi's TUI consumes (see tic-tac-toe.ts example in
-          // pi/examples/extensions). T widens to `unknown` for the union
-          // with the success-path's typed details object.
-          details: undefined,
-          isError: true,
-        };
+        return refuse(
+          `refusing '${rel}' — absolute paths and '..' segments are not permitted. Pass a path relative to the repo root that resolves under ${REVIEW_DIR}/.`,
+        );
       }
 
       const reviewRoot = resolve(ctx.cwd, REVIEW_DIR);
       const target = resolve(ctx.cwd, rel);
+      const targetParent = dirname(target);
       if (!target.startsWith(reviewRoot + sep)) {
         // Rejects both `.review` (resolves to reviewRoot exactly — writing the
         // directory itself) and any path that resolves outside reviewRoot.
-        return {
-          content: [
-            {
-              type: "text",
-              text: `artifact_review: refusing '${rel}' — resolves to '${target}', which is not strictly under ${reviewRoot}/. The artifact_review tool only writes files under ${REVIEW_DIR}/; use the write tool for any other location.`,
-            },
-          ],
-          details: undefined,
-          isError: true,
-        };
+        return refuse(
+          `refusing '${rel}' — resolves to '${target}', which is not strictly under ${reviewRoot}/. The artifact_review tool only writes files under ${REVIEW_DIR}/; use the write tool for any other location.`,
+        );
       }
 
-      await fs.mkdir(dirname(target), { recursive: true });
-
-      // Symlink defense: path.resolve() is lexical only and does not follow
-      // symlinks. An adversarial branch could plant `.review/dir → /etc` or
-      // `.review/leaf → ~/.ssh/authorized_keys` and the write would escape
-      // the directory. Realpath the parent and re-assert prefix; then open
-      // the leaf with O_NOFOLLOW so a leaf symlink fails with ELOOP rather
-      // than redirecting the write.
-      let realReviewRoot: string;
-      let realParent: string;
+      // The `.review` ROOT must be a real directory, never a symlink — checked
+      // BEFORE mkdir -p so a pre-planted `.review -> /evil` symlink cannot cause
+      // mkdir (and the later write) to escape into the link target. Absent is
+      // fine: mkdir creates it as a real directory below. (#824 Critical: an
+      // adversarial branch/worktree can commit `.review` as a symlink; O_NOFOLLOW
+      // guards only the leaf, and realpath(reviewRoot)===realpath(parent) made the
+      // old subdirectory-only check pass, so the write escaped confinement.)
       try {
-        realReviewRoot = await fs.realpath(reviewRoot);
-        realParent = await fs.realpath(dirname(target));
+        const rootInfo = await fs.lstat(reviewRoot);
+        if (rootInfo.isSymbolicLink()) {
+          return refuse(
+            `refusing '${rel}' — '${REVIEW_DIR}' is a symbolic link; the ${REVIEW_DIR}/ root must be a real directory.`,
+          );
+        }
       } catch (err) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `artifact_review: refusing '${rel}' — could not realpath parent directory: ${(err as Error).message}`,
-            },
-          ],
-          details: undefined,
-          isError: true,
-        };
-      }
-      if (
-        realParent !== realReviewRoot &&
-        !realParent.startsWith(realReviewRoot + sep)
-      ) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `artifact_review: refusing '${rel}' — parent directory resolves through a symlink to '${realParent}', which is outside '${realReviewRoot}/'.`,
-            },
-          ],
-          details: undefined,
-          isError: true,
-        };
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          return refuse(
+            `refusing '${rel}' — could not stat ${REVIEW_DIR}/: ${(err as Error).message}`,
+          );
+        }
       }
 
-      let handle;
+      await fs.mkdir(targetParent, { recursive: true });
+
+      // A symlinked parent directory yields a deterministic, clear refusal here.
+      // The O_DIRECTORY|O_NOFOLLOW open below is the atomic backstop, but its errno
+      // for a symlinked directory varies by platform (ELOOP on Linux, ENOTDIR on
+      // macOS), so classify the symlink explicitly first. (A deeper symlinked
+      // INTERMEDIATE component — where the final parent component is itself real —
+      // is not a symlink by lstat and is caught by the realpath check below.)
       try {
-        handle = await fs.open(
-          target,
-          fsConstants.O_WRONLY |
-            fsConstants.O_CREAT |
-            fsConstants.O_TRUNC |
-            fsConstants.O_NOFOLLOW,
-          0o644,
+        const parentInfo = await fs.lstat(targetParent);
+        if (parentInfo.isSymbolicLink()) {
+          return refuse(
+            `refusing '${rel}' — the parent directory is a symbolic link; Tier 3 payloads must live under a real ${REVIEW_DIR}/ tree.`,
+          );
+        }
+      } catch (err) {
+        return refuse(
+          `refusing '${rel}' — could not stat parent directory: ${(err as Error).message}`,
+        );
+      }
+
+      // Dir-fd hardening (#824). Open the parent directory itself with
+      // O_DIRECTORY|O_NOFOLLOW: this atomically rejects a symlinked final parent
+      // component (ELOOP) at the moment of use — stronger than a lexical realpath a
+      // later step could race — and yields a handle held across the leaf open. We
+      // then realpath the parent and re-assert it resolves under the verified-real
+      // `.review` root, catching a symlinked INTERMEDIATE component too. Residual:
+      // a concurrent local writer could still swap an intermediate dir between this
+      // check and the leaf open; fully closing that needs openat(2), which portable
+      // Node's fs API lacks (no dir-fd-relative open), and is out of scope for
+      // ADR-0007's single-operator trust model. The window is now two adjacent
+      // syscalls rather than a realpath→mkdir→open span.
+      let parentHandle: fs.FileHandle;
+      try {
+        parentHandle = await fs.open(
+          targetParent,
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
         );
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code === "ELOOP") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `artifact_review: refusing '${rel}' — target is a symbolic link (O_NOFOLLOW). Tier 3 payloads must be regular files under ${REVIEW_DIR}/.`,
-              },
-            ],
-            details: undefined,
-            isError: true,
-          };
+          return refuse(
+            `refusing '${rel}' — the parent directory is a symbolic link (O_NOFOLLOW). Tier 3 payloads must live under a real ${REVIEW_DIR}/ tree.`,
+          );
         }
-        throw err;
+        if (code === "ENOTDIR") {
+          return refuse(`refusing '${rel}' — the parent path is not a directory.`);
+        }
+        return refuse(
+          `refusing '${rel}' — could not open parent directory: ${(err as Error).message}`,
+        );
       }
+
+      let handle: fs.FileHandle | undefined;
+      try {
+        let realReviewRoot: string;
+        let realParent: string;
+        try {
+          realReviewRoot = await fs.realpath(reviewRoot);
+          realParent = await fs.realpath(targetParent);
+        } catch (err) {
+          return refuse(
+            `refusing '${rel}' — could not realpath parent directory: ${(err as Error).message}`,
+          );
+        }
+        if (
+          realParent !== realReviewRoot &&
+          !realParent.startsWith(realReviewRoot + sep)
+        ) {
+          return refuse(
+            `refusing '${rel}' — parent directory resolves through a symlink to '${realParent}', which is outside '${realReviewRoot}/'.`,
+          );
+        }
+
+        // Leaf open with O_NOFOLLOW: a symlinked leaf fails with ELOOP rather than
+        // redirecting the write through the link.
+        try {
+          handle = await fs.open(
+            target,
+            fsConstants.O_WRONLY |
+              fsConstants.O_CREAT |
+              fsConstants.O_TRUNC |
+              fsConstants.O_NOFOLLOW,
+            0o644,
+          );
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === "ELOOP") {
+            return refuse(
+              `refusing '${rel}' — target is a symbolic link (O_NOFOLLOW). Tier 3 payloads must be regular files under ${REVIEW_DIR}/.`,
+            );
+          }
+          throw err;
+        }
+      } finally {
+        await parentHandle.close();
+      }
+
       try {
         await handle.writeFile(content, { encoding: "utf-8" });
       } finally {
@@ -169,12 +230,7 @@ export default function (pi: ExtensionAPI) {
 
       const bytes = Buffer.byteLength(content, "utf-8");
       return {
-        content: [
-          {
-            type: "text",
-            text: `Wrote ${rel} (${bytes} bytes).`,
-          },
-        ],
+        content: [{ type: "text" as const, text: `Wrote ${rel} (${bytes} bytes).` }],
         details: { path: rel, bytes },
       };
     },
